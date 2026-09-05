@@ -1,4 +1,4 @@
-"""SparkK8sOperator — soumission SparkApplication avec labels Vigie."""
+"""SparkK8sOperator — soumission SparkApplication sur Kubernetes."""
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ import re
 import time
 from typing import Any
 
-from airflow.models import BaseOperator
 from kubernetes import client, config
 
-from vigie_spark_operator.labels import airflow_labels, merge_labels
+from vigie_spark_operator.compat import BaseOperator
+from vigie_spark_operator.labels import airflow_labels, merge_labels, sanitize_label_value
 from vigie_spark_operator.models import normalize_emptydir_list, normalize_pvc_list
 from vigie_spark_operator.retry import k8s_call_with_retry
 from vigie_spark_operator.shutdown import handle_job_timeout, resource_summary
@@ -29,10 +29,9 @@ class SparkK8sOperator(BaseOperator):
     """
     Soumet un SparkApplication via le Spark Operator K8s.
 
-    Labels ``dag_id`` / ``task_id`` / ``run_id`` / ``managed-by=vigie`` injectés
-    sur metadata, driver et executor → collecteur Vigie → capacité Supervision.
-
-    ``dry_run=True`` : construit + logue le manifeste (ressources) sans créer la CR.
+    Par défaut injecte ``dag_id`` / ``task_id`` / ``run_id`` sur metadata, driver
+    et executor. Option ``managed_by=\"vigie\"`` pour le collecteur capacité Vigie.
+    ``dry_run=True`` : construit + logue le manifeste sans créer la CR.
     """
 
     template_fields = (
@@ -72,6 +71,17 @@ class SparkK8sOperator(BaseOperator):
         executor_memory: str = "512m",
         executor_instances: int = 2,
         service_account: str = "spark",
+        # Security context — défauts historiques ; surchargeables.
+        run_as_user: int = 0,
+        fs_group: int = 0,
+        allow_privilege_escalation: bool = False,
+        # Overrides optionnels par rôle (None → valeur partagée ci-dessus)
+        driver_run_as_user: int | None = None,
+        driver_fs_group: int | None = None,
+        driver_allow_privilege_escalation: bool | None = None,
+        executor_run_as_user: int | None = None,
+        executor_fs_group: int | None = None,
+        executor_allow_privilege_escalation: bool | None = None,
         spark_conf: dict | None = None,
         labels: dict | None = None,
         env: dict | None = None,
@@ -88,6 +98,8 @@ class SparkK8sOperator(BaseOperator):
         emptydir_configs: list | None = None,
         fail_on_unschedulable: bool = True,
         dry_run: bool = False,
+        inject_airflow_labels: bool = True,
+        managed_by: str | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -108,6 +120,15 @@ class SparkK8sOperator(BaseOperator):
         self.executor_cores_request = executor_cores_request
         self.executor_instances = executor_instances
         self.service_account = service_account
+        self.run_as_user = run_as_user
+        self.fs_group = fs_group
+        self.allow_privilege_escalation = allow_privilege_escalation
+        self.driver_run_as_user = driver_run_as_user
+        self.driver_fs_group = driver_fs_group
+        self.driver_allow_privilege_escalation = driver_allow_privilege_escalation
+        self.executor_run_as_user = executor_run_as_user
+        self.executor_fs_group = executor_fs_group
+        self.executor_allow_privilege_escalation = executor_allow_privilege_escalation
         self.spark_conf = spark_conf or {}
         self.labels = labels or {}
         self.env = env or {}
@@ -119,6 +140,8 @@ class SparkK8sOperator(BaseOperator):
         self.emptydir_configs = normalize_emptydir_list(emptydir_configs)
         self.fail_on_unschedulable = fail_on_unschedulable
         self.dry_run = dry_run
+        self.inject_airflow_labels = inject_airflow_labels
+        self.managed_by = managed_by
 
         if timeout is not None:
             self.timeout_pod_discovery = 120
@@ -186,6 +209,29 @@ class SparkK8sOperator(BaseOperator):
             volumes.append({"name": ed["name"], "emptyDir": spec})
         return volumes
 
+    def _security_for(self, role: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Retourne (podSecurityContext, securityContext) pour driver|executor."""
+        if role == "driver":
+            run_as = self.driver_run_as_user if self.driver_run_as_user is not None else self.run_as_user
+            fs_group = self.driver_fs_group if self.driver_fs_group is not None else self.fs_group
+            allow_priv = (
+                self.driver_allow_privilege_escalation
+                if self.driver_allow_privilege_escalation is not None
+                else self.allow_privilege_escalation
+            )
+        else:
+            run_as = self.executor_run_as_user if self.executor_run_as_user is not None else self.run_as_user
+            fs_group = self.executor_fs_group if self.executor_fs_group is not None else self.fs_group
+            allow_priv = (
+                self.executor_allow_privilege_escalation
+                if self.executor_allow_privilege_escalation is not None
+                else self.allow_privilege_escalation
+            )
+        return (
+            {"fsGroup": int(fs_group)},
+            {"runAsUser": int(run_as), "allowPrivilegeEscalation": bool(allow_priv)},
+        )
+
     def _load_kube(self) -> None:
         try:
             if self.in_cluster:
@@ -202,13 +248,19 @@ class SparkK8sOperator(BaseOperator):
 
     def _build_spark_app_spec(self, context) -> dict[str, Any]:
         self.name = self._build_unique_name(context)
-        af_labels = airflow_labels(context)
+        af_labels = (
+            airflow_labels(context, managed_by=self.managed_by)
+            if self.inject_airflow_labels
+            else ({"managed-by": sanitize_label_value(self.managed_by)} if self.managed_by else {})
+        )
         meta_labels = merge_labels(self.labels, {"project": self.base_name}, af_labels)
         pod_labels = merge_labels({"project": self.base_name}, af_labels)
 
         env_list = [{"name": k, "value": str(v)} for k, v in self.env.items()]
         driver_mounts, executor_mounts = self._build_volume_mounts()
         volumes_list = self._build_volumes()
+        driver_pod_sc, driver_sc = self._security_for("driver")
+        executor_pod_sc, executor_sc = self._security_for("executor")
 
         spec: dict[str, Any] = {
             "apiVersion": "sparkoperator.k8s.io/v1beta2",
@@ -231,8 +283,8 @@ class SparkK8sOperator(BaseOperator):
                     "cores": self.driver_cores,
                     "memory": self.driver_memory,
                     "coreRequest": self.driver_cores_request,
-                    "podSecurityContext": {"fsGroup": 0},
-                    "securityContext": {"runAsUser": 0, "allowPrivilegeEscalation": False},
+                    "podSecurityContext": driver_pod_sc,
+                    "securityContext": driver_sc,
                     "serviceAccount": self.service_account,
                     "env": env_list,
                     "labels": pod_labels,
@@ -242,8 +294,8 @@ class SparkK8sOperator(BaseOperator):
                     "cores": self.executor_cores,
                     "memory": self.executor_memory,
                     "coreRequest": self.executor_cores_request,
-                    "podSecurityContext": {"fsGroup": 0},
-                    "securityContext": {"runAsUser": 0, "allowPrivilegeEscalation": False},
+                    "podSecurityContext": executor_pod_sc,
+                    "securityContext": executor_sc,
                     "instances": self.executor_instances,
                     "env": env_list,
                     "labels": pod_labels,

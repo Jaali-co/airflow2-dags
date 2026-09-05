@@ -32,4 +32,5 @@ with DAG(
         service_account="spark-operator-spark",
         timeout_job=600,
         queue="default",
+        managed_by="vigie",
     )
