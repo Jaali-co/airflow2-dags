@@ -1,9 +1,9 @@
-"""DAG Spark via SparkK8sOperator custom (Airflow 2)."""
+"""DAG Spark via SparkK8sOperator (package vigie-spark-operator)."""
 from datetime import datetime
 
 from airflow import DAG
 
-from vigie_operators.spark_k8s_operator import SparkK8sOperator
+from vigie_spark_operator import SparkK8sOperator
 
 with DAG(
     dag_id="af2_spark_k8s",
