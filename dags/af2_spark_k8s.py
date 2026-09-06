@@ -30,6 +30,10 @@ with DAG(
         executor_memory="512m",
         executor_instances=1,
         service_account="spark-operator-spark",
+        # Image spark:3.5.1 tourne en uid spark(185). runAsUser=0 + drop
+        # dans l'entrypoint rend le token SA illisible → 401 fabric8.
+        run_as_user=185,
+        fs_group=185,
         timeout_job=600,
         queue="default",
         managed_by="vigie",
